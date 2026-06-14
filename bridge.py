@@ -490,6 +490,105 @@ class AntigravityBridge:
         log.info(f"Injected message ({len(text)} chars)")
         return True
 
+    async def stop_generation(self) -> bool:
+        """Find the cancel/stop button in the IDE and click it."""
+        ctx_id = await self._find_cascade_context()
+        stop_click_script = r"""
+        (() => {
+            const panel = document.querySelector('.antigravity-agent-side-panel') || document;
+            
+            // 1. Check for cancel/stop button by tooltip id
+            const cancelBtn = panel.querySelector('[data-tooltip-id="input-send-button-cancel-tooltip"]');
+            if (cancelBtn) {
+                cancelBtn.click();
+                return true;
+            }
+            
+            // 2. Check for stop icon button (SVG stop icon)
+            const svgStopBtn = panel.querySelector('button svg[class*="stop"], button [class*="stop-icon"]');
+            if (svgStopBtn) {
+                const btn = svgStopBtn.closest('button');
+                if (btn) {
+                    btn.click();
+                    return true;
+                }
+            }
+            
+            // 3. Check for any button with stop-like text
+            const buttons = panel.querySelectorAll('button, [role="button"]');
+            for (const btn of buttons) {
+                const text = (btn.textContent || '').toLowerCase().trim();
+                if (/^(stop|stop generating|stop response|cancel|停止|中止|取消)$/.test(text)) {
+                    btn.click();
+                    return true;
+                }
+            }
+            return false;
+        })()
+        """
+        try:
+            clicked = await self.cdp.evaluate(stop_click_script, ctx_id)
+            return bool(clicked)
+        except Exception as e:
+            log.error(f"Error in stop_generation script: {e}")
+            return False
+
+    async def new_chat(self) -> bool:
+        """Find the new chat button in the IDE and click it."""
+        ctx_id = await self._find_cascade_context()
+        new_chat_script = r"""
+        (() => {
+            const selectors = [
+                '[data-tooltip-id*="new-chat"]',
+                '[data-tooltip-id*="clear-chat"]',
+                '[data-tooltip-id*="new-session"]',
+                '[aria-label*="New Chat" i]',
+                '[aria-label*="Clear Chat" i]',
+                '[aria-label*="新建对话"]',
+                '[aria-label*="新建会话"]',
+                '[aria-label*="清空对话"]',
+                'button[title*="New Chat" i]',
+                'button[title*="Clear Chat" i]',
+                'button[title*="新建"]'
+            ];
+            for (const sel of selectors) {
+                const el = document.querySelector(sel);
+                if (el) {
+                    el.click();
+                    return true;
+                }
+            }
+
+            const buttons = document.querySelectorAll('button, [role="button"], a');
+            for (const btn of buttons) {
+                const text = (btn.getAttribute('aria-label') || btn.getAttribute('title') || btn.textContent || '').toLowerCase().trim();
+                if (text === 'new chat' || text === 'clear chat' || text === 'new conversation' || text === '新建对话' || text === '新建会话' || text === '清空对话' || text === 'new' || text === '+') {
+                    btn.click();
+                    return true;
+                }
+            }
+
+            const svgs = document.querySelectorAll('button svg, [role="button"] svg');
+            for (const svg of svgs) {
+                const btn = svg.closest('button') || svg.closest('[role="button"]');
+                if (btn) {
+                    const btnHtml = btn.outerHTML.toLowerCase();
+                    if (btnHtml.includes('plus') || btnHtml.includes('new-chat') || btnHtml.includes('add') || btnHtml.includes('clear')) {
+                        btn.click();
+                        return true;
+                    }
+                }
+            }
+            return false;
+        })()
+        """
+        try:
+            clicked = await self.cdp.evaluate(new_chat_script, ctx_id)
+            return bool(clicked)
+        except Exception as e:
+            log.error(f"Error in new_chat script: {e}")
+            return False
+
     async def wait_for_response(self, progress_callback=None) -> str:
         """Poll the DOM until the AI response stabilizes."""
         ctx_id = await self._find_cascade_context()
@@ -1238,6 +1337,37 @@ async def cmd_memstat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_new(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update.effective_user.id):
+        return
+    global bridge
+    if not bridge or not bridge.cdp.connected:
+        await update.message.reply_text("❌ Not connected to Antigravity.")
+        return
+
+    conversation_cache.clear()
+    success = await bridge.new_chat()
+    if success:
+        await update.message.reply_text("✨ Started a new chat session in Antigravity (local cache cleared).")
+    else:
+        await update.message.reply_text("⚠️ Cleared local cache, but could not find the 'New Chat' button in Antigravity UI.")
+
+
+async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update.effective_user.id):
+        return
+    global bridge
+    if not bridge or not bridge.cdp.connected:
+        await update.message.reply_text("❌ Not connected to Antigravity.")
+        return
+
+    success = await bridge.stop_generation()
+    if success:
+        await update.message.reply_text("🛑 Sent stop/cancel signal to Antigravity.")
+    else:
+        await update.message.reply_text("⚠️ No active generation or could not find the stop button in Antigravity UI.")
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update.effective_user.id):
         return
@@ -1684,6 +1814,8 @@ async def post_init(application):
     try:
         await application.bot.set_my_commands([
             BotCommand("start", "Welcome message & help"),
+            BotCommand("new", "Start a new chat session"),
+            BotCommand("stop", "Stop current response generation"),
             BotCommand("status", "Check CDP connection status"),
             BotCommand("reconnect", "Reconnect to Antigravity"),
             BotCommand("restart", "Save work & restart Antigravity"),
@@ -1711,15 +1843,20 @@ def main():
     log.info(f"Allowed users: {ALLOWED_USER_IDS}")
 
     builder = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).post_init(post_init)
-    proxy = os.getenv("http_proxy") or os.getenv("HTTP_PROXY") or "http://127.0.0.1:7897"
+    # 使用环境变量代理，如果没有设置则不使用代理
+    proxy = os.getenv("http_proxy") or os.getenv("HTTP_PROXY")
     if proxy:
         log.info(f"Using proxy: {proxy}")
         builder = builder.proxy(proxy).get_updates_proxy(proxy)
+    else:
+        log.info("No proxy configured, connecting directly")
         
     app = builder.build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("stop", cmd_stop))
     app.add_handler(CommandHandler("model", cmd_model))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("reconnect", cmd_reconnect))
